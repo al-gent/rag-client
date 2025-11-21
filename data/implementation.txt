@@ -1,0 +1,74 @@
+RAG Pipeline Implementation Documentation
+
+Architecture Overview
+This is a production-ready Retrieval-Augmented Generation (RAG) system built with a microservices architecture using Docker containers. The system enables semantic search across document collections and generates contextual answers using large language models.
+
+Technology Stack
+- Backend: FastAPI (Python web framework)
+- Vector Database: Qdrant (self-hosted in Docker)
+- Embedding Model: sentence-transformers (BAAI/bge-small-en-v1.5, 384 dimensions)
+- LLM: OpenAI GPT-4 via API
+- Frontend: Next.js with React
+- Containerization: Docker and Docker Compose
+- Deployment Target: DigitalOcean VPS
+
+Core Components
+
+Vector Database (Qdrant)
+Qdrant stores document embeddings as vectors in a collection called "documents". Each vector point contains:
+- 384-dimensional embedding vector
+- Metadata payload with original text, source filename, and chunk ID
+- Unique UUID identifier
+- Cosine similarity is used as the distance metric for retrieval
+
+Embedding Pipeline
+Documents are processed through the following pipeline:
+1. PDF text extraction using pypdf library
+2. Text chunking with 1000 character chunks and 200 character overlap
+3. Embedding generation using sentence-transformers bge-small model
+4. Vector storage in Qdrant with metadata preservation
+
+Query Process
+When a user submits a question:
+1. Question is embedded using the same bge-small model
+2. Qdrant performs cosine similarity search to find top 3 most relevant chunks
+3. Retrieved chunks are combined with the user question into a prompt
+4. Prompt is sent to OpenAI GPT-4 API
+5. Generated answer and source citations are returned to the frontend
+
+API Endpoints
+- GET / : Health check endpoint
+- POST /load-documents : Batch load PDFs from data directory
+- POST /upload : Upload individual PDF files
+- POST /query : Submit questions and receive answers with sources
+- GET /documents : Get collection statistics
+
+Deployment Architecture
+The system runs as two Docker containers orchestrated by Docker Compose:
+- qdrant container: Runs Qdrant vector database on port 6333
+- api container: Runs FastAPI application on port 8000
+
+Data persistence is achieved through Docker volumes mapping ./qdrant_data to the container storage. Code hot-reloading is enabled in development through volume mounting of main.py.
+
+Chunk Strategy
+The chunking approach balances context preservation with search precision:
+- Chunk size: 1000 characters (~200 words)
+- Overlap: 200 characters to maintain context across boundaries
+- Simple character-based splitting (can be upgraded to semantic chunking)
+
+CORS Configuration
+The API allows cross-origin requests from localhost:3000 for development and can be configured to allow requests from production domains.
+
+Scalability Considerations
+Current implementation uses in-memory processing and single-threaded embedding. For production scale:
+- Consider batch embedding with GPU acceleration
+- Implement caching for frequently accessed embeddings  
+- Add rate limiting and authentication
+- Use async/await for concurrent query processing
+- Implement horizontal scaling with load balancer
+
+Known Limitations
+- Duplicate detection not implemented (same document uploaded twice creates duplicate vectors)
+- No user authentication or multi-tenancy support
+- Text-only PDF support (no OCR for scanned documents)
+- Limited to documents that fit in memory during processing
