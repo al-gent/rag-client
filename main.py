@@ -15,6 +15,7 @@ import time
 from pydantic import BaseModel
 from typing import Optional 
 import requests 
+import traceback
 
 # Logging API request models
 class QueryLogRequest(BaseModel):
@@ -50,7 +51,7 @@ class UploadLogRequest(BaseModel):
 
 RAG_HARDWARE_ID = os.getenv("RAG_HARDWARE_ID", "local-dev")
 LLM_HARDWARE_ID = os.getenv("LLM_HARDWARE_ID", "local-dev")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+MODEL_NAME = os.getenv("LLM_MODEL")
 LOG_SERVER_URL = os.getenv("LOG_SERVER_URL", None)
 
 app = FastAPI()
@@ -67,7 +68,21 @@ app.add_middleware(
 # Initialize clients
 qdrant = QdrantClient(host="qdrant", port=6333)
 embed_model = SentenceTransformer('BAAI/bge-small-en-v1.5')
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def get_llm_client():
+    provider = os.getenv("LLM_PROVIDER", "openai")
+    
+    if provider == "openai":
+        return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    else:
+        # For local/self-hosted providers
+        return OpenAI(
+            base_url=os.getenv("LLM_BASE_URL"),
+            api_key="not-needed"  # Most local servers don't validate this
+        )
+# Usage
+client = get_llm_client()
+
 COLLECTION_NAME = "documents"
 
 def init_collection():
@@ -260,27 +275,95 @@ def load_documents():
         raise HTTPException(status_code=404, detail="No PDF or TXT files found in data/ directory")
     
     points = []
-    for file in files:
-        # Extract text
-        text = extract_text_from_file(str(file))
-        
-        # Chunk it
-        chunks = chunk_text(text)
-        
-        for i, chunk in enumerate(chunks):
-            embedding = embed_model.encode(chunk).tolist()
-            point = PointStruct(
-                id=str(uuid.uuid4()),
-                vector=embedding,
-                payload={
-                    "text": chunk,
-                    "source": file.name,
-                    "chunk_id": i
-                }
-            )
-            points.append(point)
     
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    for file in files:
+        upload_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        try:
+            # Get file size
+            file_size_bytes = file.stat().st_size
+            
+            # Extract text
+            extract_start = time.time()
+            text = extract_text_from_file(str(file))
+            text_extraction_time_ms = (time.time() - extract_start) * 1000
+            
+            # Chunk it
+            chunk_start = time.time()
+            chunks = chunk_text(text)
+            chunking_time_ms = (time.time() - chunk_start) * 1000
+            
+            # Embed chunks
+            embed_start = time.time()
+            file_points = []
+            for i, chunk in enumerate(chunks):
+                embedding = embed_model.encode(chunk).tolist()
+                point = PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=embedding,
+                    payload={
+                        "text": chunk,
+                        "source": file.name,
+                        "chunk_id": i
+                    }
+                )
+                file_points.append(point)
+            embedding_time_ms = (time.time() - embed_start) * 1000
+            
+            # Upload to vector store
+            vector_start = time.time()
+            qdrant.upsert(collection_name=COLLECTION_NAME, points=file_points)
+            vector_store_time_ms = (time.time() - vector_start) * 1000
+            
+            total_time_ms = (time.time() - start_time) * 1000
+            
+            # Log success
+            log_data = {
+                "upload_id": upload_id,
+                "rag_hardware_id": RAG_HARDWARE_ID,
+                "filename": file.name,
+                "num_chunks": len(chunks),
+                "file_size_bytes": file_size_bytes,
+                "text_extraction_time_ms": text_extraction_time_ms,
+                "chunking_time_ms": chunking_time_ms,
+                "embedding_time_ms": embedding_time_ms,
+                "vector_store_time_ms": vector_store_time_ms,
+                "total_time_ms": total_time_ms,
+                "success": True,
+                "error_message": None
+            }
+            
+            if LOG_SERVER_URL:
+                send_log_to_server("/api/log-upload", log_data)
+            else:
+                print("WARNING: LOG_SERVER_URL not configured - upload not logged!")
+            
+            points.extend(file_points)
+            
+        except Exception as e:
+            # Log failure
+            total_time_ms = (time.time() - start_time) * 1000
+            log_data = {
+                "upload_id": upload_id,
+                "rag_hardware_id": RAG_HARDWARE_ID,
+                "filename": file.name,
+                "num_chunks": 0,
+                "file_size_bytes": 0,
+                "text_extraction_time_ms": 0.0,
+                "chunking_time_ms": 0.0,
+                "embedding_time_ms": 0.0,
+                "vector_store_time_ms": 0.0,
+                "total_time_ms": total_time_ms,
+                "success": False,
+                "error_message": str(e)
+            }
+            
+            if LOG_SERVER_URL:
+                send_log_to_server("/api/log-upload", log_data)
+            
+            print(f"Error processing {file.name}: {str(e)}")
+            # Continue with other files
     
     return {
         "message": f"Loaded {len(files)} documents with {len(points)} chunks",
@@ -356,7 +439,7 @@ def query(request: QueryRequest):
 
         Answer:"""
         
-        response = openai_client.chat.completions.create(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context."},
@@ -368,11 +451,15 @@ def query(request: QueryRequest):
         
         answer = response.choices[0].message.content
         
-        # Calculate cost estimate (gpt-4o-mini: $0.15/1M input, $0.60/1M output)
-        input_tokens = response.usage.prompt_tokens
-        output_tokens = response.usage.completion_tokens
-        estimated_cost_usd = (input_tokens * 0.15 / 1_000_000) + (output_tokens * 0.60 / 1_000_000)
-        
+        # Get token counts
+        if hasattr(response, 'usage') and response.usage:
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+        else:
+            # Estimate for local models
+            input_tokens = len(prompt) // 4
+            output_tokens = len(answer) // 4
+
         # Calculate total time
         total_time_ms = (time.time() - start_time) * 1000
         
@@ -389,10 +476,13 @@ def query(request: QueryRequest):
             "vector_search_time_ms": vector_search_time_ms,
             "llm_time_ms": llm_time_ms,
             "total_time_ms": total_time_ms,
-            "estimated_cost_usd": estimated_cost_usd,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "estimated_cost_usd": 0.0,  # don't need it but db schema expects it
             "success": True,
             "error_message": None
         }
+        print(f"DEBUG: Sending log with times - embed:{embedding_time_ms}, search:{vector_search_time_ms}, llm:{llm_time_ms}, total:{total_time_ms}")
         
         if not LOG_SERVER_URL:
             print("WARNING: LOG_SERVER_URL not configured - query not logged!")
@@ -439,6 +529,8 @@ def query(request: QueryRequest):
             elif not send_log_to_server("/api/log-query", log_data):
                 print(f"ERROR: Failed to send error log to {LOG_SERVER_URL}")
             
+            print(f"Error: {str(e)}")
+            print(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
 
